@@ -57,8 +57,3 @@ The solution is deployed using CloudFormation template `access-key-rotation.yaml
 ## Contributing
 
 Feel free to submit issues and pull requests.
-
-## License
-
-[Your chosen license]
-
