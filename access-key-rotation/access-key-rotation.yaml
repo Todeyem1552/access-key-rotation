@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Enforce IAM Access Key rotation with AWS Config (pre-enabled), SNS alerts, and auto-remediation via SSM Automation invoking a Lambda. Stores rotated credentials as encrypted CSV in S3.
+
+Parameters:
+  MaxAccessKeyAge:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Maximum age (in days) before an IAM access key must be rotated.
+  ResourceKey:
+    Type: String
+    Default: Project
+    Description: Tag key for resources created by this stack.
+  ResourceValue:
+    Type: String
+    Default: IAM-Key-Rotation
+    Description: Tag value for resources created by this stack.
+
+Resources:
+  #################################
+  # S3 bucket for rotated credentials (CSV)
+  #################################
+  RotatedKeysBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # NOTE: S3 bucket names must be globally unique and lowercase. If create fails due to name,
+      # remove BucketName to let CloudFormation auto-generate one.
+      BucketName: !Sub '${AWS::StackName}-rotated-keys'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: !Ref ResourceKey
+          Value: !Ref ResourceValue
+
+  #################################
+  # SNS for Alerts (no secrets published)
+  #################################
+  KeyRotationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: IAMKeyRotationAlerts
+      TopicName: !Sub '${AWS::StackName}-key-rotation-alerts'
+      Tags:
+        - Key: !Ref ResourceKey
+          Value: !Ref ResourceValue
+
+  #####################################################
+  # IAM Key Rotation Lambda & Role (least privilege)
+  #####################################################
+  KeyRotationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows Lambda to manage IAM keys, write to S3, and publish to SNS
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMKeyRotationOps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMOps
+                Effect: Allow
+                Action:
+                  - iam:ListAccessKeys
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
+                  - iam:GetUser
+                Resource: '*'
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref KeyRotationSNSTopic
+              - Sid: WriteRotatedKeys
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${RotatedKeysBucket.Arn}/*'
+
+  KeyRotationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 120
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref KeyRotationSNSTopic
+          MAX_AGE_DAYS: !Ref MaxAccessKeyAge
+          ROTATED_KEYS_BUCKET: !Ref RotatedKeysBucket
+      Code:
+        ZipFile: |
+          import csv, io, boto3, os
+          from datetime import datetime, timezone
+
+          iam = boto3.client('iam')
+          sns = boto3.client('sns')
+          s3  = boto3.client('s3')
+
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          MAX_AGE_DAYS = int(os.environ['MAX_AGE_DAYS'])
+          ROTATED_KEYS_BUCKET = os.environ['ROTATED_KEYS_BUCKET']
+
+          def _publish(subject, message):
+              sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+
+          def lambda_handler(event, context):
+              # Accepts either {"userName": "..."} or a raw string username
+              user_name = event.get('userName') if isinstance(event, dict) else str(event)
+
+              if not user_name:
+                  _publish("IAM Key Rotation - Missing user",
+                           f"Invocation missing userName. Event: {event}")
+                  return {"status": "error", "reason": "missing userName"}
+
+              # List existing keys
+              keys = iam.list_access_keys(UserName=user_name)['AccessKeyMetadata']
+              now = datetime.now(timezone.utc)
+
+              # Identify keys older than threshold
+              stale_keys = [k for k in keys if (now - k['CreateDate']).days > MAX_AGE_DAYS]
+
+              if not stale_keys:
+                  return {"status": "ok", "message": f"No stale keys for {user_name}"}
+
+              # Sort by CreateDate (oldest first)
+              keys_sorted = sorted(keys, key=lambda k: k['CreateDate'])
+
+              # If already 2 keys, delete the oldest first to make room
+              if len(keys_sorted) >= 2:
+                  oldest = keys_sorted[0]
+                  iam.update_access_key(UserName=user_name,
+                                        AccessKeyId=oldest['AccessKeyId'],
+                                        Status='Inactive')
+                  iam.delete_access_key(UserName=user_name,
+                                        AccessKeyId=oldest['AccessKeyId'])
+
+              # Create a new key
+              new_key = iam.create_access_key(UserName=user_name)['AccessKey']
+
+              # Deactivate & delete all stale keys (that are not the new one)
+              for k in stale_keys:
+                  if k['AccessKeyId'] != new_key['AccessKeyId']:
+                      iam.update_access_key(UserName=user_name,
+                                            AccessKeyId=k['AccessKeyId'],
+                                            Status='Inactive')
+                      iam.delete_access_key(UserName=user_name,
+                                            AccessKeyId=k['AccessKeyId'])
+
+              # Build CSV: UserName, AccessKeyId, SecretAccessKey
+              csv_buffer = io.StringIO()
+              writer = csv.writer(csv_buffer)
+              writer.writerow(["UserName", "AccessKeyId", "SecretAccessKey"])
+              writer.writerow([user_name, new_key['AccessKeyId'], new_key['SecretAccessKey']])
+
+              # Object key path: userName/AccessKeyId.csv
+              object_key = f"{user_name}/{new_key['AccessKeyId']}.csv"
+
+              # Store in S3 (SSE-S3)
+              s3.put_object(
+                  Bucket=ROTATED_KEYS_BUCKET,
+                  Key=object_key,
+                  Body=csv_buffer.getvalue(),
+                  ServerSideEncryption='AES256'
+              )
+
+              # Notify (no secret in message)
+              _publish(
+                  "IAM Access Key Rotated",
+                  (
+                      f"Rotated access key(s) for IAM user '{user_name}'. "
+                      f"Credentials stored securely in s3://{ROTATED_KEYS_BUCKET}/{object_key}. "
+                      "Access is restricted via IAM; retrieve the CSV from S3."
+                  )
+              )
+
+              return {"status": "rotated", "user": user_name, "newKeyId": new_key['AccessKeyId'], "s3Object": object_key}
+
+  #####################################################
+  # SSM Automation Runbook (invokes Lambda)
+  #####################################################
+  InvokeKeyRotationRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: InvokeKeyRotationLambda
+      Content:
+        schemaVersion: '0.3'
+        description: Invoke the IAM key rotation Lambda for a specific IAM user.
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: (Required) The ARN of the role that allows Automation to perform the actions.
+          UserName:
+            type: String
+            description: (Required) IAM user name to remediate.
+        mainSteps:
+          - name: InvokeRotationLambda
+            action: 'aws:invokeLambdaFunction'
+            inputs:
+              FunctionName: !Ref KeyRotationLambda
+              InputPayload:
+                userName: "{{ UserName }}"
+      Tags:
+        - Key: !Ref ResourceKey
+          Value: !Ref ResourceValue
+
+  #####################################################
+  # AWS Config Managed Rule (uses existing AWS Config setup)
+  #####################################################
+  AccessKeysRotatedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: access-keys-rotated
+      Description: Ensure IAM access keys are rotated within the specified number of days.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::User
+      Source:
+        Owner: AWS
+        SourceIdentifier: ACCESS_KEYS_ROTATED
+      InputParameters:
+        maxAccessKeyAge: !Ref MaxAccessKeyAge
+
+  #####################################################
+  # Remediation: Map IAM user -> Runbook(UserName)
+  #####################################################
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role used by SSM Automation to invoke the rotation Lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RemediationInvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt KeyRotationLambda.Arn
+
+  RemediationConfiguration:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref AccessKeysRotatedRule
+      TargetType: SSM_DOCUMENT
+      TargetId: !Ref InvokeKeyRotationRunbook
+      Automatic: true
+      MaximumAutomaticAttempts: 1
+      RetryAttemptSeconds: 60
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationRole.Arn
+        UserName:
+          ResourceValue:
+            Value: RESOURCE_ID
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref KeyRotationSNSTopic
+    Description: SNS Topic ARN for IAM key rotation alerts
+  RotatedKeysBucketName:
+    Value: !Ref RotatedKeysBucket
+    Description: S3 bucket where rotated key CSV files are stored
+  RunbookName:
+    Value: !Ref InvokeKeyRotationRunbook
+    Description: Name of the SSM Automation runbook used for remediation
