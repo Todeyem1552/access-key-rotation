@@ -206,7 +206,7 @@ Resources:
           AutomationAssumeRole:
             type: String
             description: (Required) The ARN of the role that allows Automation to perform the actions.
-          UserName:
+          userName:
             type: String
             description: (Required) IAM user name to remediate.
         mainSteps:
@@ -215,7 +215,7 @@ Resources:
             inputs:
               FunctionName: !Ref KeyRotationLambda
               InputPayload:
-                userName: "{{ UserName }}"
+                userName: "{{ userName }}"
       Tags:
         - Key: !Ref ResourceKey
           Value: !Ref ResourceValue
