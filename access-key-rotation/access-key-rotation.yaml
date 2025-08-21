@@ -274,7 +274,7 @@ Resources:
           StaticValue:
             Values:
               - !GetAtt RemediationRole.Arn
-        UserName:
+        userName:
           ResourceValue:
             Value: RESOURCE_ID
 
