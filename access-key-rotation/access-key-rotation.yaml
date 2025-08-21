@@ -214,8 +214,10 @@ Resources:
             action: 'aws:invokeLambdaFunction'
             inputs:
               FunctionName: !Ref KeyRotationLambda
-              InputPayload:
-                userName: "{{ userName }}"
+              InputPayload: |
+                {
+                  "userName": "{{ userName }}"
+                }
       Tags:
         - Key: !Ref ResourceKey
           Value: !Ref ResourceValue
@@ -276,7 +278,7 @@ Resources:
               - !GetAtt RemediationRole.Arn
         userName:
           ResourceValue:
-            Value: RESOURCE_ID
+            Value: RESOURCE_NAME
 
 Outputs:
   SNSTopicArn:
