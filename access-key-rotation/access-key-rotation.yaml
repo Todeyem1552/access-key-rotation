@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Enforce IAM Access Key rotation with AWS Config (pre-enabled), SNS alerts, and auto-remediation via SSM Automation invoking a Lambda. Stores rotated credentials as encrypted CSV in S3.
+Description: Enforce IAM Access Key rotation with AWS Config, SNS alerts, and auto-remediation via SSM Automation invoking a Lambda. Rotated credentials are stored as an encrypted CSV in S3.
 
 Parameters:
   MaxAccessKeyAge:
@@ -27,8 +27,6 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      # NOTE: S3 bucket names must be globally unique and lowercase. If create fails due to name,
-      # remove BucketName to let CloudFormation auto-generate one.
       BucketName: !Sub '${AWS::StackName}-rotated-keys'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -40,7 +38,7 @@ Resources:
           Value: !Ref ResourceValue
 
   #################################
-  # SNS for Alerts (no secrets published)
+  # SNS for Alerts
   #################################
   KeyRotationSNSTopic:
     Type: AWS::SNS::Topic
@@ -51,15 +49,21 @@ Resources:
         - Key: !Ref ResourceKey
           Value: !Ref ResourceValue
 
+  KeyRotationSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: todeyemi60@gmail.com
+      TopicArn: !Ref KeyRotationSNSTopic
+
   #####################################################
   # IAM Key Rotation Lambda & Role (least privilege)
   #####################################################
   KeyRotationLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: Allows Lambda to manage IAM keys, write to S3, and publish to SNS
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -68,27 +72,32 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: IAMKeyRotationOps
+        - PolicyName: KeyRotationPolicy
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
-              - Sid: IAMOps
-                Effect: Allow
+              # IAM user key management (scoped to IAM users)
+              - Effect: Allow
                 Action:
                   - iam:ListAccessKeys
-                  - iam:CreateAccessKey
                   - iam:UpdateAccessKey
                   - iam:DeleteAccessKey
-                  - iam:GetUser
-                Resource: '*'
-              - Sid: PublishAlerts
-                Effect: Allow
+                  - iam:CreateAccessKey
+                Resource: arn:aws:iam::*:user/*
+              # Query AWS Config for resourceId -> userName
+              - Effect: Allow
+                Action:
+                  - config:SelectResourceConfig
+                  - config:SelectAggregateResourceConfig
+                Resource: "*"
+              # Notifications
+              - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref KeyRotationSNSTopic
-              - Sid: WriteRotatedKeys
-                Effect: Allow
+              # Write rotated key CSV
+              - Effect: Allow
                 Action: s3:PutObject
-                Resource: !Sub '${RotatedKeysBucket.Arn}/*'
+                Resource: !Sub "${RotatedKeysBucket.Arn}/*"
 
   KeyRotationLambda:
     Type: AWS::Lambda::Function
@@ -102,75 +111,151 @@ Resources:
           SNS_TOPIC_ARN: !Ref KeyRotationSNSTopic
           MAX_AGE_DAYS: !Ref MaxAccessKeyAge
           ROTATED_KEYS_BUCKET: !Ref RotatedKeysBucket
+          # Optional: set explicitly to your AWS Config home region for global resources
+          CONFIG_REGION: !Ref AWS::Region
       Code:
         ZipFile: |
-          import csv, io, boto3, os
+          import csv
+          import io
+          import boto3
+          import os
+          import re
+          import json
           from datetime import datetime, timezone
 
           iam = boto3.client('iam')
           sns = boto3.client('sns')
           s3  = boto3.client('s3')
 
-          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
-          MAX_AGE_DAYS = int(os.environ['MAX_AGE_DAYS'])
+          SNS_TOPIC_ARN   = os.environ['SNS_TOPIC_ARN']
+          MAX_AGE_DAYS    = int(os.environ['MAX_AGE_DAYS'])
           ROTATED_KEYS_BUCKET = os.environ['ROTATED_KEYS_BUCKET']
+          CONFIG_REGION   = os.environ.get('CONFIG_REGION')
+
+          # resourceId for IAM users looks like AIDA..., resembles an access key format.
+          CANDIDATE_ID_RE = re.compile(r'^[A-Z0-9]{16,24}$')
 
           def _publish(subject, message):
-              sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+              try:
+                  sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+              except Exception as e:
+                  print("SNS publish failed:", e)
+
+          def _select_username_from_config(resource_id, region):
+              try:
+                  cfg = boto3.client('config', region_name=region) if region else boto3.client('config')
+                  expr = f"SELECT configuration.userName WHERE resourceType = 'AWS::IAM::User' AND resourceId = '{resource_id}'"
+                  resp = cfg.select_resource_config(Expression=expr)
+                  if resp.get('Results'):
+                      doc = json.loads(resp['Results'][0])
+                      return doc.get('configuration', {}).get('userName')
+              except Exception as e:
+                  print(f"Config select failed in {region or 'current'} for {resource_id}: {e}")
+              return None
+
+          def _username_from_resource_id(resource_id):
+              # Try CONFIG_REGION, then session region, then us-east-1 (common home for global resources)
+              tried = []
+              session_region = boto3.session.Session().region_name
+              for r in [CONFIG_REGION, session_region, 'us-east-1']:
+                  if r and r not in tried:
+                      tried.append(r)
+                      uname = _select_username_from_config(resource_id, r)
+                      if uname:
+                          print(f"Resolved {resource_id} -> {uname} via AWS Config in {r}")
+                          return uname
+              return None
+
+          def _fallback_username_from_access_key_id(maybe_access_key_id):
+              # Fallback if someone actually passed a *real* access key id (AKIA/ASIA...)
+              try:
+                  resp = iam.get_access_key_last_used(AccessKeyId=maybe_access_key_id)
+                  return resp.get('UserName')
+              except Exception as e:
+                  print(f"get_access_key_last_used failed for {maybe_access_key_id}: {e}")
+                  return None
+
+          def _resolve_username(resource_value):
+              if not resource_value:
+                  return None
+
+              # ARN like arn:aws:iam::123456789012:user/username
+              if isinstance(resource_value, str) and resource_value.startswith('arn:') and ':user/' in resource_value:
+                  return resource_value.split('/')[-1]
+
+              # If it looks like an ID (Config resourceId or AccessKeyId), first try Config mapping
+              if isinstance(resource_value, str) and CANDIDATE_ID_RE.match(resource_value):
+                  uname = _username_from_resource_id(resource_value)
+                  if uname:
+                      return uname
+                  # Fallback: if it was actually an access key id, try IAM direct
+                  return _fallback_username_from_access_key_id(resource_value)
+
+              # Otherwise assume it's already a username
+              return resource_value
 
           def lambda_handler(event, context):
-              # Accepts either {"userName": "..."} or a raw string username
-              user_name = event.get('userName') if isinstance(event, dict) else str(event)
+              print("EVENT:", json.dumps(event))
+              resource_value = None
+              if isinstance(event, dict) and 'userName' in event:
+                  resource_value = event['userName']
+                  if isinstance(resource_value, dict):
+                      try:
+                          resource_value = next(iter(resource_value.values()))
+                      except Exception:
+                          resource_value = None
+              elif isinstance(event, str):
+                  resource_value = event
 
+              user_name = _resolve_username(resource_value)
               if not user_name:
-                  _publish("IAM Key Rotation - Missing user",
-                           f"Invocation missing userName. Event: {event}")
-                  return {"status": "error", "reason": "missing userName"}
+                  reason = f"Cannot resolve IAM username from payload: {json.dumps(event)}"
+                  print(reason)
+                  _publish("IAM Key Rotation - Unable to identify user", reason)
+                  return {"status": "error", "reason": "cannot resolve user"}
 
               # List existing keys
-              keys = iam.list_access_keys(UserName=user_name)['AccessKeyMetadata']
-              now = datetime.now(timezone.utc)
+              try:
+                  keys = iam.list_access_keys(UserName=user_name)['AccessKeyMetadata']
+              except Exception as e:
+                  reason = f"Failed to list access keys for {user_name}: {e}"
+                  print(reason)
+                  _publish("IAM Key Rotation - Failed to list keys", reason)
+                  return {"status": "error", "reason": "cannot list keys"}
 
-              # Identify keys older than threshold
+              now = datetime.now(timezone.utc)
               stale_keys = [k for k in keys if (now - k['CreateDate']).days > MAX_AGE_DAYS]
+              print(f"Stale keys for {user_name}: {[k['AccessKeyId'] for k in stale_keys]}")
 
               if not stale_keys:
                   return {"status": "ok", "message": f"No stale keys for {user_name}"}
 
-              # Sort by CreateDate (oldest first)
+              # If 2 keys already, remove oldest to make room
               keys_sorted = sorted(keys, key=lambda k: k['CreateDate'])
-
-              # If already 2 keys, delete the oldest first to make room
               if len(keys_sorted) >= 2:
                   oldest = keys_sorted[0]
-                  iam.update_access_key(UserName=user_name,
-                                        AccessKeyId=oldest['AccessKeyId'],
-                                        Status='Inactive')
-                  iam.delete_access_key(UserName=user_name,
-                                        AccessKeyId=oldest['AccessKeyId'])
+                  print(f"Deactivating & deleting oldest key {oldest['AccessKeyId']} for {user_name}")
+                  iam.update_access_key(UserName=user_name, AccessKeyId=oldest['AccessKeyId'], Status='Inactive')
+                  iam.delete_access_key(UserName=user_name, AccessKeyId=oldest['AccessKeyId'])
 
               # Create a new key
               new_key = iam.create_access_key(UserName=user_name)['AccessKey']
+              print(f"Created new key {new_key['AccessKeyId']} for {user_name}")
 
-              # Deactivate & delete all stale keys (that are not the new one)
+              # Deactivate & delete stale keys (except the new one)
               for k in stale_keys:
                   if k['AccessKeyId'] != new_key['AccessKeyId']:
-                      iam.update_access_key(UserName=user_name,
-                                            AccessKeyId=k['AccessKeyId'],
-                                            Status='Inactive')
-                      iam.delete_access_key(UserName=user_name,
-                                            AccessKeyId=k['AccessKeyId'])
+                      print(f"Removing stale key {k['AccessKeyId']} for {user_name}")
+                      iam.update_access_key(UserName=user_name, AccessKeyId=k['AccessKeyId'], Status='Inactive')
+                      iam.delete_access_key(UserName=user_name, AccessKeyId=k['AccessKeyId'])
 
-              # Build CSV: UserName, AccessKeyId, SecretAccessKey
+              # Build & upload CSV to S3
               csv_buffer = io.StringIO()
               writer = csv.writer(csv_buffer)
               writer.writerow(["UserName", "AccessKeyId", "SecretAccessKey"])
               writer.writerow([user_name, new_key['AccessKeyId'], new_key['SecretAccessKey']])
 
-              # Object key path: userName/AccessKeyId.csv
               object_key = f"{user_name}/{new_key['AccessKeyId']}.csv"
-
-              # Store in S3 (SSE-S3)
               s3.put_object(
                   Bucket=ROTATED_KEYS_BUCKET,
                   Key=object_key,
@@ -178,14 +263,9 @@ Resources:
                   ServerSideEncryption='AES256'
               )
 
-              # Notify (no secret in message)
               _publish(
                   "IAM Access Key Rotated",
-                  (
-                      f"Rotated access key(s) for IAM user '{user_name}'. "
-                      f"Credentials stored securely in s3://{ROTATED_KEYS_BUCKET}/{object_key}. "
-                      "Access is restricted via IAM; retrieve the CSV from S3."
-                  )
+                  f"Rotated access key(s) for '{user_name}'. CSV stored at s3://{ROTATED_KEYS_BUCKET}/{object_key}"
               )
 
               return {"status": "rotated", "user": user_name, "newKeyId": new_key['AccessKeyId'], "s3Object": object_key}
@@ -208,22 +288,20 @@ Resources:
             description: (Required) The ARN of the role that allows Automation to perform the actions.
           userName:
             type: String
-            description: (Required) IAM user name to remediate.
+            description: (Required) IAM user name or Config resourceId (e.g., AIDA...).
         mainSteps:
           - name: InvokeRotationLambda
             action: 'aws:invokeLambdaFunction'
             inputs:
               FunctionName: !Ref KeyRotationLambda
-              InputPayload: |
-                {
-                  "userName": "{{ userName }}"
-                }
+              InputPayload:
+                userName: '{{ userName }}'
       Tags:
         - Key: !Ref ResourceKey
           Value: !Ref ResourceValue
 
   #####################################################
-  # AWS Config Managed Rule (uses existing AWS Config setup)
+  # AWS Config Managed Rule
   #####################################################
   AccessKeysRotatedRule:
     Type: AWS::Config::ConfigRule
@@ -240,7 +318,7 @@ Resources:
         maxAccessKeyAge: !Ref MaxAccessKeyAge
 
   #####################################################
-  # Remediation: Map IAM user -> Runbook(UserName)
+  # Remediation Role & Configuration
   #####################################################
   RemediationRole:
     Type: AWS::IAM::Role
@@ -270,7 +348,7 @@ Resources:
       TargetId: !Ref InvokeKeyRotationRunbook
       Automatic: true
       MaximumAutomaticAttempts: 1
-      RetryAttemptSeconds: 60
+      RetryAttemptSeconds: 300
       Parameters:
         AutomationAssumeRole:
           StaticValue:
@@ -278,7 +356,7 @@ Resources:
               - !GetAtt RemediationRole.Arn
         userName:
           ResourceValue:
-            Value: RESOURCE_NAME
+            Value: RESOURCE_ID   # Config passes resourceId; Lambda resolves username via AWS Config
 
 Outputs:
   SNSTopicArn:
